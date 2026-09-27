@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+~/abbas_crack/
+hs/
+dumps/
+*.cap
+*.pcap
+*.csv
+cracked.json
+state.json
+abbas.log
+eid_greetings.log
+pass123.txt
