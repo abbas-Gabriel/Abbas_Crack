@@ -1,0 +1,18 @@
+# Abbas Crack
+
+🇮🇶 أداة كسر شبكات WPA/WPA2 — من تطوير جنرال عباس
+
+📸 Instagram: [@s.nfu](https://instagram.com/s.nfu)
+
+## التثبيت
+git clone https://github.com/abbas-Gabriel/Abbas_Crack.git
+cd Abbas_Crack
+
+## الاستخدام
+sudo python3 abbas_crack.py
+
+## المتطلبات
+sudo apt install aircrack-ng python3
+
+## الترخيص
+تعليمي فقط.
